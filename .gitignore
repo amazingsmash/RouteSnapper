@@ -1,0 +1,6 @@
+__pycache__
+Data
+Results
+query_cache.json
+.idea
+*.DS_Store
