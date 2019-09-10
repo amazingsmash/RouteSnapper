@@ -1,4 +1,4 @@
-from shapely.geometry import LineString, MultiLineString
+from shapely.geometry import LineString, MultiLineString, Point
 import overpy
 import time
 
@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import json
 
 import route
+from route import Route
+import numpy as np
 
 
 class ObjectCache:
@@ -33,32 +35,37 @@ class ObjectCache:
 
 
 class WaySet:
+    ways_cache = ObjectCache()
 
     def __init__(self, lines):
         self.multiline = MultiLineString(lines)
-
-    ways_cache = ObjectCache()
+        self.headings = [Route.get_heading(l.coords[0][1], l.coords[0][0], l.coords[1][1], l.coords[1][0]) for l in
+                         lines]
 
     @staticmethod
-    def download_all_ways(sector, onlyTram=False):
+    def download_all_ways(sector, tram_only=False, timestamp=None):
+
         bbox = "%f,%f,%f,%f" % sector
         ext = 0.01
         ext_bbox = "%f,%f,%f,%f" % (sector[0] - ext, sector[1] - ext, sector[2] + ext, sector[3] + ext)
 
-        if onlyTram:
-            query = '[out:json];(node({{ext_bbox}});way["railway"="tram"]({{bbox}}););out;'
+        if tram_only:
+            query = '[out:json]{{date}};(node({{ext_bbox}});way["railway"="tram"]({{bbox}}););out;'
         else:
-            query = '[out:json];(way["highway"]({{bbox}});node({{ext_bbox}}););out;'
+            query = '[out:json]{{date}};(way["highway"]({{bbox}});node({{ext_bbox}}););out;'
 
         query = query.replace("{{bbox}}", bbox)
         query = query.replace("{{ext_bbox}}", ext_bbox)
+
+        timestamp = "[date:\"%s\"]" % timestamp if timestamp is not None else ""
+        query = query.replace("{{date}}", timestamp)
 
         ways = WaySet.ways_cache.get_from_cache(query)
         if ways is None:
             api = overpy.Overpass()
             try:
                 result = api.query(query)
-            except:
+            except overpy.OverpassTooManyRequests:
                 time.sleep(20)
                 result = api.query(query)
 
@@ -66,8 +73,12 @@ class WaySet:
             for w in result.ways:
                 try:
                     nodes = w.get_nodes(resolve_missing=False)
-                except:
-                    nodes = w.get_nodes(resolve_missing=True)
+                except overpy.exception.DataIncomplete:
+                    try:
+                        nodes = w.get_nodes(resolve_missing=True)
+                    except overpy.exception.DataIncomplete:
+                        print("Overpass can't resolve nodes. Skipping way.")
+                        continue
                 nodes = [[float(n.lon), float(n.lat)] for n in nodes]
                 ways += [nodes]
 
@@ -91,7 +102,7 @@ class WaySet:
         new_point = self.multiline[i_dist].interpolate(projection)
         new_next_point = self.multiline[i_dist].interpolate(next_proj)
 
-        heading = route.Route.get_heading(new_point.y, new_point.x, new_next_point.y, new_next_point.x)
+        heading = Route.get_heading(new_point.y, new_point.x, new_next_point.y, new_next_point.x)
 
         return new_point, i_dist, heading
 
@@ -109,35 +120,92 @@ class WaySet:
         i_min_dist = distances.index(min_distance)
         return self.multiline[i_min_dist]
 
+    def get_closest_way_with_heading(self, point, heading, heading_tolerance=45):
+        heading = heading % 360
+        lines = self.multiline
+        projections = [l.project(point, normalized=True) for l in lines]
+        lines = [l for l, p in zip(lines, projections) if 0 < p < 1]
+
+        headings = np.array([WaySet.get_linestring_heading_at_projection(l, p)
+                    for l, p in zip(lines, projections)])
+        headings_diff = np.abs(headings % 360 - heading)
+        # print(headings_diff)
+        if (headings_diff < heading_tolerance).any():
+            lines = [l for l, hd in zip(lines, headings_diff) if hd < heading_tolerance]
+
+        distances = [line.distance(point) for line in lines]
+
+        min_distance = min(distances)
+        i_min_dist = distances.index(min_distance)
+
+        return lines[i_min_dist]
+
+
+    @staticmethod
+    def get_linestring_heading_at_projection(linestring, projection):
+
+        ps = [linestring.project(Point(c), normalized=True) for c in linestring.coords]
+
+        for prev_c, c in zip(linestring.coords[:-1], linestring.coords[1:]):
+            p = linestring.project(Point(c))
+            if p > projection:
+                return Route.get_heading(prev_c[1], prev_c[0], c[1], c[0])
+
+        prev_c = linestring.coords[-2]
+        c = linestring.coords[-1]
+        return Route.get_heading(prev_c[1], prev_c[0], c[1], c[0])
+
     def snap_points(self, points):
         last_way = None
         snapped_points = []
         last_distance = None
+
+        # headings before snapping
+        headings = []
+        for i, p in enumerate(points):
+            if i < len(points) - 1:
+                next_point = points[i + 1]
+                headings.append(Route.get_heading(p.y, p.x, next_point.y, next_point.x))
+        headings.append(headings[-1])
+
+        h_diff = []
+
         for point_index in range(len(points)):
 
             point = points[point_index]
+            heading = headings[point_index]
 
-            if last_way is not None:
-                projection = last_way.project(point)
-                distance = last_way.distance(point)
-                if 0 <= projection <= 1 and distance < 1.1 * last_distance:
-                    snapped_point = last_way.interpolate(projection)
-                    last_distance = distance
-                    snapped_points += [snapped_point]
-                    continue
+            # if last_way is not None:
+            #     projection = last_way.project(point)
+            #     distance = last_way.distance(point)
+            #     if 0 <= projection <= 1 and distance < 1.1 * last_distance:
+            #         snapped_point = last_way.interpolate(projection)
+            #         last_distance = distance
+            #         snapped_points += [snapped_point]
+            #         continue
 
-            last_way = self.get_closest_way(point)
+            last_way = self.get_closest_way_with_heading(point, heading)
+
+            # last_way = self.get_closest_way(point)
             projection = last_way.project(point)
-            last_distance = last_way.distance(point)
+            # last_distance = last_way.distance(point)
             snapped_point = last_way.interpolate(projection)
+
+            h = WaySet.get_linestring_heading_at_projection(last_way, projection)
+
+            h_diff += [headings[point_index] - h]
 
             snapped_points += [snapped_point]
 
+        # plt.plot(h_diff)
+        # plt.show()
+
+        # headings after snapping
         headings = []
         for i, p in enumerate(snapped_points):
-            if i < len(snapped_points)-1:
-                next_point = snapped_points[i+1]
-                headings.append(route.Route.get_heading(p.y, p.x, next_point.y, next_point.x))
+            if i < len(snapped_points) - 1:
+                next_point = snapped_points[i + 1]
+                headings.append(Route.get_heading(p.y, p.x, next_point.y, next_point.x))
         headings.append(headings[-1])
 
-        return route.Route.from_points(snapped_points, headings)
+        return Route.from_points(snapped_points, headings)
