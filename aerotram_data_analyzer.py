@@ -6,7 +6,8 @@ import os
 from route import Route
 from waySet import WaySet
 from matplotlib.pyplot import figure
-
+from heatmap import generate_heatmap
+import matplotlib
 
 def filter_sector(df, sector):
     f = df["Latitude"] > sector[0]
@@ -73,6 +74,20 @@ def analyze_drive(drive_name, drive_data):
     way_set.plot()
     #plt.show()
     plt.savefig("Results/" + drive_name + ".svg")
+    plt.clf()
+
+    hm_image = generate_heatmap(drive_data["Longitude"],
+                            drive_data["Latitude"],
+                            drive_data["1MinMean"],
+                            img_size=(200, 200))
+
+    hm_image = np.flip(hm_image.T, axis=0)
+
+    matplotlib.image.imsave("Results/" + drive_name + "_HeatMap.png", hm_image, cmap='hot')
+
+    figure(num=None, figsize=(10, 10), dpi=80, facecolor='w', edgecolor='k')
+    plt.plot(np.array(drive_data["1MinMean"]))
+    plt.savefig("Results/" + drive_name + "_DataProfile.png")
     plt.clf()
 
 
